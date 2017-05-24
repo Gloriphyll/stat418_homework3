@@ -1,0 +1,156 @@
+---
+title: 'STAT 418 Homework #3'
+author: "Max Belasco"
+date: "May 23, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+.libPaths("C:/Users/max")
+setwd("C:/Users/max/adult_data")
+adult <- read.table("adult.data")
+colnames(adult) <- c("age", "work_class", "fnlwgt", "education", "edu_num", "marital_status", "occupation", "relationship", "race", "sex", "capital_gain", "capital_loss", "hours_per_week", "native_country", "income")
+
+
+```
+
+#Logistic Regression
+
+
+For logsitics regression we will be looking at the __glmnet.R__ package as well as the __h2o.R__ package. 
+
+
+##Using the glmnet.R Package
+```{r cars}
+library(readr)
+library(glmnet)
+library(ROCR)
+
+N <- nrow(adult)
+idx <- sample(1:N, 0.6*N)
+adult_train <- adult[idx,]
+adult_test <- adult[-idx,]
+
+X <- Matrix::sparse.model.matrix(income ~ . - 1, data = adult)
+X_train <- X[idx,]
+X_test <- X[-idx,]
+
+system.time({
+     adult_inc <- glmnet(X_train, adult_train$income, family = "binomial", lambda = 1)
+ })
+
+phat <- predict(adult_inc, newx = X_test, type = "response")
+rocr_pred <- prediction(phat, adult_test$income)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+```
+
+Here is a plot of the ROC curve:
+```{r}
+perf <- performance(rocr_pred, measure = "tpr", x.measure = "fpr")
+plot(perf)
+```
+
+From what it looks like there isn't much of an effective optimization of testing involved here at all. Relationship between TPR and FPR is a straight line. 
+
+##Using the h2o.R Package
+```{r}
+library(h2o)
+
+h2o.init(nthreads=-1)
+
+dx <-h2o.importFile("adult.data")
+colnames(dx) <- c("age", "work_class", "fnlwgt", "education", "edu_num", "marital_status", "occupation", "relationship", "race", "sex", "capital_gain", "capital_loss", "hours_per_week", "native_country", "income")
+
+dx_split <- h2o.splitFrame(dx, ratios = 0.6, seed = 123)
+dx_train <- dx_split[[1]]
+dx_test <- dx_split[[2]]
+
+Xnames <- names(dx_train)[which(names(dx_train)!="income")]
+system.time({
+     md <- h2o.glm(x=Xnames, y = "income", training_frame = dx_train, family = "binomial", alpha = 1, lambda = 0)
+})
+
+h2o.auc(h2o.performance(md, dx_test))
+
+md
+```
+
+
+
+#Random Forest Calculations
+
+##Using the h2o.R Package
+
+```{r pressure, echo=FALSE}
+
+system.time({
+     md <- h2o.randomForest(x = Xnames, y = "income", training_frame = dx_train, ntrees = 500)
+})
+
+h2o.auc(h2o.performance(md, dx_test))
+
+
+md
+```
+
+Here is a TPR vs. FPR plot. As you can see, this appears to become more optimized at a sooer rate than the other plot - this gets to a high true positive rate of 0.8 when false positives are at 0.2.
+
+```{r}
+plot(h2o.performance(md, dx_test))
+```
+
+
+##Using the xgboost.R package
+
+```{r}
+library(xgboost)
+
+system.time({
+     n_proc <- parallel::detectCores()
+     md <- xgboost(data = X_train, label = ifelse(adult_train$income==">50K",1,0),
+                   nthread = n_proc, nround = 1, max_depth = 20,
+                   num_parallel_tree = 500, subsample = 0.632,
+                   colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                   save_period = NULL)
+})
+
+phat <- predict(md, newdata = X_test)
+rocr_pred <- prediction(phat, adult_test$income)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+```
+
+#Generalized Boosted Models
+
+##Using the h2o.R package
+```{r}
+system.time({
+     md <- h2o.gbm(x = Xnames, y = "income", training_frame = dx_train, distribution = "bernoulli", 
+                   ntrees = 300, max_depth = 20, learn_rate = 0.1, 
+                   nbins = 100, seed = 123)    
+})
+
+h2o.auc(h2o.performance(md, dx_test))
+
+md
+```
+Out of the different combinations I tried, this yielded the most accurate confusion matrix - barely any false positives or negatives. 
+
+
+##Using the xgboost.R package
+```{r}
+dxgb_train <- xgb.DMatrix(data = X_train, label = ifelse(adult_train$income==">50K",1,0))
+system.time({
+     n_proc <- parallel::detectCores()
+     md <- xgb.train(data = dxgb_train, nthread = n_proc, objective = "binary:logistic", nround = 300, max_depth = 20, eta = 0.1)
+})
+
+phat <- predict(md, newdata = X_test)
+rocr_pred <- prediction(phat, adult_test$income)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+Performance for AUC is very high in this regard. 
