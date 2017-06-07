@@ -1,0 +1,203 @@
+---
+title: 'Stat 418 Homework #4'
+author: "Max Belasco"
+date: "June 6, 2017"
+output: html_document
+---
+
+
+The dataset comes from a collaboration between Wordline and the Universite Libre de Bruxelles (ULB). The variables were obtained through Principle Components Analysis (PCA). Today we're going to run this data through some of the machine learning algorithms and methods we have learned over the quarter, and see how each one fairs in helping to predict fradulent and non-fradulent credit card reports. 
+
+```{r}
+creditcard <- read.csv("C:/Users/compadmin/data/creditcard/creditcard.csv")
+creditcard$Class <- as.factor(creditcard$Class)
+
+library(h2o)
+library(data.table)
+library(caret)
+
+```
+
+## Neural Networks
+
+We will be using the __h2o__ package to run some neural network algorithms on our data, and see what levels of accuracy we can attain from that. First we will attempt a simple neural network design:
+
+```{r}
+h2o.init(max_mem_size = "12g")
+
+dx <- h2o.importFile("C:/Users/compadmin/data/creditcard/creditcard.csv")
+dx$Class <- as.factor(dx$Class)
+dx_split <- h2o.splitFrame(dx, ratios = c(0.6, 0.2), seed = 1122)
+dx_train <- dx_split[[1]]
+dx_valid <- dx_split[[2]]
+dx_test <- dx_split[[3]]
+
+dx_names <- names(dx_train)[which(names(dx_train) !="Class")]
+
+system.time({
+     md_basic <- h2o.deeplearning(x = dx_names, y = "Class", training_frame = dx_train, validation_frame = dx_valid, epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0) 
+ })
+
+h2o.performance(md_basic, dx_test)@metrics$AUC
+```
+
+The next approach we'll try is early stopping:
+
+```{r}
+system.time({
+     md_early <- h2o.deeplearning(x = dx_names, y = "Class", training_frame = dx_train, validation_frame = dx_valid, epochs = 10000, stopping_rounds = 2, stopping_metric = "misclassification", stopping_tolerance = 0.01) 
+ })
+
+h2o.performance(md_early, dx_test)@metrics$AUC
+```
+
+In this approach I manually tune the adaptive learning rate and adjust the momentum myself. 
+```{r}
+system.time({
+     md_momentum <- h2o.deeplearning(x = dx_names, y = "Class", training_frame = dx_train, validation_frame = dx_valid, epochs = 10, adaptive_rate = F, rate=0.01, rate_annealing=2e-6, momentum_start=0.2, momentum_stable=0.4, momentum_ramp=1e7, stopping_rounds = 2, stopping_metric = "misclassification", stopping_tolerance = 0.01) 
+ })
+
+h2o.performance(md_momentum, dx_test)@metrics$AUC
+```
+
+
+From the neural network tests located here it seems as if the adjusted learning/momentum approach provided the strongest AUC. I'm concerned however that there might be overfitting issues as the learning parameters were manually tinkered with. This method may need a couple more training methods to ensure accuracy. 
+
+#Gradient Boost Algorithms: With and Without Hyperparameter Optimization
+
+Another approach we can look into is running a hyperparameter optimization on our Gradient Boost Algorithm Model (GBM). 
+```{r eval=FALSE}
+dx_names <- names(dx_train)[which(names(dx_train) !="Class")]
+hyper_params <- list( ntrees = 10000,  ## early stopping
+                       max_depth = 5:15, 
+                       min_rows = c(1,3,10,30,100),
+                       learn_rate = c(0.01,0.03,0.1),  
+                       learn_rate_annealing = c(0.99,0.995,1,1),
+                       sample_rate = c(0.4,0.7,1,1),
+                       col_sample_rate = c(0.7,1,1),
+                       nbins = c(30,100,300),
+                       nbins_cats = c(64,256,1024)
+)
+
+search_criteria <- list( strategy = "RandomDiscrete",
+                          max_runtime_secs = 10*3600,
+                          max_models = 100
+)
+
+system.time({
+     mds <- h2o.grid(algorithm = "gbm", grid_id = "grd",
+                     x = dx_names, y = "Class", training_frame = dx_train,
+                     validation_frame = dx_valid,
+                     hyper_params = hyper_params,
+                     search_criteria = search_criteria,
+                     stopping_metric = "AUC", stopping_tolerance = 1e-3, stopping_rounds = 2,
+                     seed = 1122)
+})
+```
+
+(I don't have this block running because in each iteration I perform for this I get a time out. This particular function can run on for hours without completion)
+
+
+Let's compare that to what we get with running GBM without any hyperparameter optimization:
+```{r}
+train.index <- createDataPartition(creditcard$Class, p = .70, list = FALSE)
+train <- creditcard[train.index,]
+test <- creditcard[-train.index,]
+
+train.h2o <- as.h2o(train)
+test.h2o <- as.h2o(test)
+
+x.indep <- c(1:30)
+
+system.time(
+     gbm.model <- h2o.gbm(y="Class", x=x.indep, training_frame = train.h2o, distribution = "bernoulli", ntrees = 1000, max_depth = 4, learn_rate = 0.01, seed = 1122)
+)
+
+h2o.auc(h2o.performance(gbm.model, test.h2o))
+```
+
+An important aspect here is to consider the trade-off of time. Optimizing the parameters for this dataset takes a considerably longer amount of time than by running a simple GBM model. Even after trying to do some manual adjustments to the hyperparameters tested (I tried adjusting the ntree count) this was going to take a long amount of time to finish. For matters of expediency I strongly recommend going along with the GBM model, which already has a very strong AUC score as it is. 
+
+
+## Assessing Ensembles
+
+Up to this point we have been adjusting neural network models and trying to find optimized hyperparameters for the GBM. These are singular models, however, and there may be value in combining several to see if we can find a way to optimize the AUC. We can do such by ensembling some models we're familiar with together.
+
+I'm first going to create models for each type of model we've used before (GLM, RandomForest, GBM, and Neural Network) and find their individual AUCs. We can then compare that to the AUC of those models ensembled together.
+
+First we can set up a GLM:
+
+```{r}
+system.time({
+     md1 <- h2o.glm(x = dx_names, y = "Class", training_frame = dx_train, 
+                    family = "binomial", 
+                    alpha = 1, lambda = 0,
+                    seed = 1122,
+                    nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+})
+```
+
+And then a RandomForest model:
+
+```{r}
+system.time({
+     md2 <- h2o.randomForest(x = dx_names, y = "Class", training_frame = dx_train, 
+                             ntrees = 300,
+                             seed = 1122,
+                             nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+ })
+```
+
+Then, GBM:
+
+```{r}
+system.time({
+  md3 <- h2o.gbm(x = dx_names, y = "Class", training_frame = dx_train, distribution = "bernoulli", 
+                ntrees = 200, max_depth = 10, learn_rate = 0.1, 
+                nbins = 100, seed = 1122,
+                nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)    
+})
+```
+
+Finally, our neural net:
+
+```{r}
+
+system.time({
+  md4 <- h2o.deeplearning(x = dx_names, y = "Class", training_frame = dx_train, 
+            epochs = 5,
+            seed = 1122,
+            nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE) 
+})
+```
+
+Finally we can combine all of these into a fully stacked ensemble:
+
+```{r}
+md_ens <- h2o.stackedEnsemble(x = dx_names, y = "Class", training_frame = dx_train, base_models = list(md1@model_id, md2@model_id, md3@model_id, md4@model_id))
+```
+
+
+We can then attain each of their AUC scores:
+```{r}
+h2o.auc(h2o.performance(md1, dx_test))
+h2o.auc(h2o.performance(md2, dx_test))
+h2o.auc(h2o.performance(md3, dx_test))
+h2o.auc(h2o.performance(md4, dx_test))
+h2o.auc(h2o.performance(md_ens, dx_test))
+```
+
+
+From what it looks like the GLM model provides the largest AUC score, coming slightly higher than the AUC of the combined ensemble stack.
+
+Taking a look at the summaries of both __md1__ and __md_ens__ it looks like there are comparable levels in accuracy. However if I had to pick one I would suggest using the ensemble in the future. There's more power in having multiple models converge and give a similar level of accuracy than just achieving it with one. 
+
+## Summary and Review
+
+Looking at this from a practical perspective, I think we should consider the data that we're working with, which has already been filtered through PCA which has identified several good factors for determining credit card fraudelence. As that's the case it may not be a surprise that some of the more simple approaches we have explored have given comparable (if not better) AUC scores than the more sophisticated modeling that we have done in this report. 
+
+It's worth mentioning, however, that there are some drawbacks to using AUC scores as the main metric for assessing these models. A major deficiency is that the AUC uses different misclassification cost distributions for different classifiers. This can be tantamount to using different metrics to evaluate different classification processes. 
+
+With that in mind we may want to consider what give us more confidence in the model. Combining multiple models together can give us assurances that our predictions will be accurate, and the ensemble analysis appears to provide that. I'm more inclined to using that method as opposed to the tinkered neural network approaches as I'm concerned about overfitting in those situations. Overfitting can be dealt with through mutliple tests, but then that becomes a question of how long does it take to train the model. 
+
+In short, for our purpose of detecting fraudulent credit card charges I strongly recommend using the ensemble analysis, which puts together multiple tests that provide a strong, accurate result. The GLM is a faster alternative, but as training an ensemble method does not appear to take too long (perhaps an hour) the time spent on training a more reliable model would definitely be worth it in this case. 
